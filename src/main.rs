@@ -10,8 +10,9 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
     },
+    net::TcpStream,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tiny_http::{Header, Method, Request, Response, Server};
 
@@ -567,14 +568,53 @@ fn embedded_broker() -> Result<()> {
     Ok(())
 }
 
+// ----------------------------------------------------------------------- all
+
+/// Blocks until the broker accepts TCP connections, so the clients do not race it.
+fn wait_for_broker() -> Result<()> {
+    let (host, port) = broker();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if TcpStream::connect((host.as_str(), port)).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!("broker on {host}:{port} did not come up within 10s")
+}
+
+/// Runs broker, kitchen, dashboard and customer in one process.
+fn all() -> Result<()> {
+    thread::spawn(|| {
+        if let Err(error) = embedded_broker() {
+            eprintln!("broker: {error}");
+        }
+    });
+    wait_for_broker()?;
+
+    for (name, run) in [
+        ("kitchen", kitchen as fn() -> Result<()>),
+        ("dashboard", dashboard as fn() -> Result<()>),
+    ] {
+        thread::spawn(move || {
+            if let Err(error) = run() {
+                eprintln!("{name}: {error}");
+            }
+        });
+    }
+
+    customer()
+}
+
 fn main() -> Result<()> {
     match env::args().nth(1).as_deref() {
+        Some("all") => all(),
         Some("broker") => embedded_broker(),
         Some("customer") => customer(),
         Some("kitchen") => kitchen(),
         Some("dashboard") => dashboard(),
         _ => {
-            eprintln!("usage: cargo run -- broker|customer|kitchen|dashboard");
+            eprintln!("usage: cargo run -- all|broker|customer|kitchen|dashboard");
             eprintln!("env:   MQTT_BROKER (default localhost), MQTT_PORT (default 1883)");
             Ok(())
         }
