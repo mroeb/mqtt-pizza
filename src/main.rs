@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     env,
+    net::{TcpStream, ToSocketAddrs},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
     },
-    net::TcpStream,
     thread,
     time::{Duration, Instant},
 };
@@ -251,6 +251,15 @@ td.time{font-family:var(--mono);font-size:12px;color:var(--muted);text-align:rig
 .live i{width:7px;height:7px;border-radius:50%;background:var(--ok);
   animation:pulse 2s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.25}}
+a{color:var(--ember)}
+.wrap.wide{max-width:1500px}
+.frames{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+.frame{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.frame h3{margin:0;padding:12px 16px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--muted);font-weight:600;border-bottom:1px solid var(--line);
+  display:flex;justify-content:space-between;gap:10px}
+.frame h3 a{font-family:var(--mono);text-transform:none;letter-spacing:0;text-decoration:none}
+.frame iframe{display:block;width:100%;height:540px;border:0;background:var(--bg)}
 @media(max-width:560px){.wrap{padding:28px 16px 60px}select{min-width:0}form{flex-direction:column}}
 "#;
 
@@ -263,17 +272,23 @@ fn escape(value: &str) -> String {
 }
 
 fn page(title: &str, body: &str, script: &str) -> String {
+    render(title, body, script, false)
+}
+
+fn render(title: &str, body: &str, script: &str, wide: bool) -> String {
     let (host, port) = broker();
+    let wrap = if wide { "wrap wide" } else { "wrap" };
     format!(
         r#"<!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} · Pizza MQTT</title><style>{CSS}</style></head>
-<body><div class="wrap"><header>
+<body><div class="{wrap}"><header>
 <h1>{title}<span class="dot">.</span></h1>
 <span class="meta live"><i></i>{host}:{port}</span>
 </header>{body}</div><script>{script}</script></body></html>"#,
         title = escape(title),
         CSS = CSS,
+        wrap = wrap,
         host = escape(&host),
         body = body,
         script = script,
@@ -468,6 +483,33 @@ fn cook(client: ClientHandle, orders: Orders, mut order: Order) {
 
 // ----------------------------------------------------------------- dashboard
 
+/// Feeds order and client-status messages into the shared state.
+fn watch(connection: Connection, orders: Orders, clients: Clients) {
+    pump(connection, move |topic, payload| {
+        if topic.starts_with(STATUS_ROOT) {
+            if let Ok(order) = serde_json::from_slice::<Order>(payload) {
+                upsert(&orders, order);
+            }
+        } else if topic.starts_with(CLIENTS_ROOT)
+            && let Ok(status) = serde_json::from_slice::<ClientStatus>(payload)
+        {
+            clients.lock().unwrap().insert(status.client, status.status);
+        }
+    });
+}
+
+fn snapshot(clients: &Clients) -> Vec<ClientStatus> {
+    clients
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(client, status)| ClientStatus {
+            client: client.clone(),
+            status: status.clone(),
+        })
+        .collect()
+}
+
 fn dashboard() -> Result<()> {
     let (mut client, connection) = connect("dashboard");
     online(&mut client, "dashboard")?;
@@ -476,38 +518,15 @@ fn dashboard() -> Result<()> {
 
     let orders: Orders = Arc::new(Mutex::new(Vec::new()));
     let clients: Clients = Arc::new(Mutex::new(BTreeMap::new()));
-    let seen_orders = orders.clone();
-    let seen_clients = clients.clone();
-    pump(connection, move |topic, payload| {
-        if topic.starts_with(STATUS_ROOT) {
-            if let Ok(order) = serde_json::from_slice::<Order>(payload) {
-                upsert(&seen_orders, order);
-            }
-        } else if topic.starts_with(CLIENTS_ROOT)
-            && let Ok(status) = serde_json::from_slice::<ClientStatus>(payload)
-        {
-            seen_clients
-                .lock()
-                .unwrap()
-                .insert(status.client, status.status);
-        }
-    });
+    watch(connection, orders.clone(), clients.clone());
 
     let server = http("0.0.0.0:3002")?;
     println!("dashboard http://localhost:3002");
     serve(server, move |_, path, _| {
         if path == "/api" {
             let list = orders.lock().unwrap();
-            let map = clients.lock().unwrap();
-            let clients: Vec<_> = map
-                .iter()
-                .map(|(client, status)| ClientStatus {
-                    client: client.clone(),
-                    status: status.clone(),
-                })
-                .collect();
             return Reply::Json(
-                serde_json::json!({ "orders": *list, "clients": clients }).to_string(),
+                serde_json::json!({ "orders": *list, "clients": snapshot(&clients) }).to_string(),
             );
         }
         Reply::Html(page(
@@ -522,6 +541,101 @@ poll('/api',d=>{{document.getElementById('clients').innerHTML=rows(d.clients,{{
   empty:'Keine Clients verbunden.'}})}});"#,
                 orders_js = order_rows_js("orders"),
             ),
+        ))
+    });
+    Ok(())
+}
+
+// ------------------------------------------------------------------ overview
+
+/// The three web UIs the overview embeds and health-checks.
+const PANELS: [(&str, &str, u16); 3] = [
+    ("Kunde", "customer", 3000),
+    ("Küche", "kitchen", 3001),
+    ("Dashboard", "dashboard", 3002),
+];
+
+fn reachable(host: &str, port: u16) -> bool {
+    (host, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .is_some_and(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok())
+}
+
+/// A single page that embeds the other UIs and tracks which ones are up.
+fn overview() -> Result<()> {
+    let (mut client, connection) = connect("overview");
+    online(&mut client, "overview")?;
+    client.subscribe(STATUS_FILTER, QoS::AtLeastOnce)?;
+    client.subscribe(CLIENTS_FILTER, QoS::AtLeastOnce)?;
+
+    let orders: Orders = Arc::new(Mutex::new(Vec::new()));
+    let clients: Clients = Arc::new(Mutex::new(BTreeMap::new()));
+    watch(connection, orders.clone(), clients.clone());
+
+    let server = http("0.0.0.0:3003")?;
+    println!("overview  http://localhost:3003");
+    serve(server, move |_, path, _| {
+        if path == "/api" {
+            let map: HashMap<String, String> = snapshot(&clients)
+                .into_iter()
+                .map(|status| (status.client, status.status))
+                .collect();
+            let services: Vec<_> = PANELS
+                .iter()
+                .map(|(label, name, port)| {
+                    serde_json::json!({
+                        "label": label,
+                        "name": name,
+                        "port": port,
+                        "http": reachable("127.0.0.1", *port),
+                        "mqtt": map.get(*name).cloned().unwrap_or_else(|| "offline".into()),
+                    })
+                })
+                .collect();
+            let list = orders.lock().unwrap();
+            return Reply::Json(
+                serde_json::json!({ "orders": *list, "services": services }).to_string(),
+            );
+        }
+
+        let frames: String = PANELS
+            .iter()
+            .map(|(label, _, port)| {
+                format!(
+                    r##"<div class="frame"><h3>{label}<a href="#" data-link="{port}" target="_blank">:{port}</a></h3>
+<iframe data-port="{port}" title="{label}"></iframe></div>"##
+                )
+            })
+            .collect();
+
+        Reply::Html(render(
+            "Übersicht",
+            &format!(
+                r#"<section><h2>Dienste</h2><div class="panel" id="services"></div></section>
+<section><h2>Alle Bestellungen</h2><div class="panel" id="orders"></div></section>
+<section><h2>Live-Ansichten</h2><div class="frames">{frames}</div></section>"#
+            ),
+            &format!(
+                r#"{JS_LIB}
+const url=p=>'http://'+location.hostname+':'+p+'/';
+document.querySelectorAll('iframe[data-port]').forEach(f=>f.src=url(f.dataset.port));
+document.querySelectorAll('a[data-link]').forEach(a=>a.href=url(a.dataset.link));
+poll('/api',d=>{{
+  document.getElementById('services').innerHTML=rows(d.services,{{
+    head:'<thead><tr><th>Dienst</th><th>Port</th><th>HTTP</th><th>MQTT</th></tr></thead>',
+    row:s=>'<tr><td>'+s.label+'</td><td class="id">:'+s.port+'</td><td>'
+      +pill(s.http?'online':'offline')+'</td><td>'+pill(s.mqtt)+'</td></tr>',
+    empty:'Keine Dienste.'}});
+  document.getElementById('orders').innerHTML=rows(d.orders,{{
+    head:'<thead><tr><th>Nr.</th><th>Pizza</th><th>Größe</th><th>Status</th><th></th></tr></thead>',
+    row:o=>'<tr><td class="id">#'+o.order_id+'</td><td>'+o.pizza+'</td><td>'+o.size+'</td><td>'
+      +pill(o.status)+'</td><td class="time">'+ago(o.timestamp)+'</td></tr>',
+    empty:'Noch keine Bestellung.'}});
+}});"#
+            ),
+            true,
         ))
     });
     Ok(())
@@ -595,6 +709,7 @@ fn all() -> Result<()> {
     for (name, run) in [
         ("kitchen", kitchen as fn() -> Result<()>),
         ("dashboard", dashboard as fn() -> Result<()>),
+        ("overview", overview as fn() -> Result<()>),
     ] {
         thread::spawn(move || {
             if let Err(error) = run() {
@@ -613,8 +728,9 @@ fn main() -> Result<()> {
         Some("customer") => customer(),
         Some("kitchen") => kitchen(),
         Some("dashboard") => dashboard(),
+        Some("overview") => overview(),
         _ => {
-            eprintln!("usage: cargo run -- all|broker|customer|kitchen|dashboard");
+            eprintln!("usage: cargo run -- all|broker|customer|kitchen|dashboard|overview");
             eprintln!("env:   MQTT_BROKER (default localhost), MQTT_PORT (default 1883)");
             Ok(())
         }
